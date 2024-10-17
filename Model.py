@@ -3,17 +3,20 @@ import os
 import glob
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, Bidirectional, LSTM, TimeDistributed, Dropout, Dense
+from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, Bidirectional, LSTM, TimeDistributed, Dropout, \
+    Dense
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import Callback
 import librosa
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
+import random
 
-
+# Параметры
 EPOCH = 15
-LEN_SEQ = 1000
+LEN_SEQ = 1000  # Максимальная длина последовательности
+BATCH_SIZE = 8
 
 
 # Взвешенная бинарная кросс-энтропия
@@ -23,6 +26,7 @@ def weighted_binary_crossentropy(pos_weight):
         weight = y_true * pos_weight + (1. - y_true)
         weighted_bce = weight * bce
         return tf.reduce_mean(weighted_bce)
+
     return loss
 
 
@@ -58,43 +62,125 @@ def get_timecodes(y_pred_binary, sr=16000, frame_step=0.01):
     return timecodes_list
 
 
-# Функция для загрузки датасета
-def load_dataset(dataset_folder):
-    features_files = sorted(glob.glob(os.path.join(dataset_folder, 'features_*.npy')))
-    labels_files = sorted(glob.glob(os.path.join(dataset_folder, 'labels_*.npy')))
+# Функция для загрузки сбалансированного датасета
+def load_balanced_dataset(dataset_folder):
+    """
+    Загружает сбалансированные фреймы признаков и меток из файлов .npy.
 
-    features_list = []
-    labels_list = []
+    Args:
+        dataset_folder (str): Путь к папке с сохраненным датасетом.
 
-    for features_file, labels_file in zip(features_files, labels_files):
-        features = np.load(features_file)
-        labels = np.load(labels_file)
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Массивы фреймов признаков и меток.
+    """
+    features_path = os.path.join(dataset_folder, 'balanced_features.npy')
+    labels_path = os.path.join(dataset_folder, 'balanced_labels.npy')
 
-        features_list.append(features)
-        labels_list.append(labels)
+    if not os.path.exists(features_path):
+        raise FileNotFoundError(f"Файл с признаками не найден: {features_path}")
+    if not os.path.exists(labels_path):
+        raise FileNotFoundError(f"Файл с метками не найден: {labels_path}")
 
-    return features_list, labels_list
+    features = np.load(features_path, allow_pickle=True)
+    labels = np.load(labels_path, allow_pickle=True)
+
+    return features, labels
 
 
 # Функция для паддинга последовательностей признаков
-def pad_sequences(sequences, maxlen):
-    num_sequences = len(sequences)
-    num_features = sequences[0].shape[1]
-    padded_sequences = np.zeros((num_sequences, maxlen, num_features))
-    for i, seq in enumerate(sequences):
-        length = min(seq.shape[0], maxlen)
-        padded_sequences[i, :length, :] = seq[:length, :]
-    return padded_sequences
+def pad_sequences_custom(features, maxlen):
+    """
+    Паддинг последовательностей признаков до максимальной длины.
+
+    Args:
+        features (List[np.ndarray]): Список последовательностей фреймов признаков.
+        maxlen (int): Максимальная длина последовательности.
+
+    Returns:
+        np.ndarray: Падженные последовательности признаков.
+    """
+    num_samples = len(features)
+    num_features = features[0].shape[1]  # Assume shape (frames, num_features)
+    padded_features = np.zeros((num_samples, maxlen, num_features))
+
+    for i, feature in enumerate(features):
+        length = min(feature.shape[0], maxlen)
+        padded_features[i, :length, :] = feature[:length, :]
+
+    return padded_features
 
 
 # Функция для паддинга меток
-def pad_labels(labels_list, maxlen):
-    num_sequences = len(labels_list)
-    padded_labels = np.zeros((num_sequences, maxlen))
-    for i, labels in enumerate(labels_list):
-        length = min(len(labels), maxlen)
-        padded_labels[i, :length] = labels[:length]
+def pad_labels_custom(labels, maxlen):
+    """
+    Паддинг меток до максимальной длины.
+
+    Args:
+        labels (List[np.ndarray]): Список последовательностей меток.
+        maxlen (int): Максимальная длина последовательности.
+
+    Returns:
+        np.ndarray: Падженные метки.
+    """
+    num_samples = len(labels)
+    padded_labels = np.zeros((num_samples, maxlen))
+
+    for i, label in enumerate(labels):
+        length = min(len(label), maxlen)
+        padded_labels[i, :length] = label[:length]
+
     return padded_labels
+
+
+# Функция для балансировки датасета на уровне последовательностей
+def balance_dataset_sequential(features, labels, downsample_factor=12, oversample_factor=4, random_seed=42):
+    """
+    Балансирует датасет путем доунсемплинга последовательностей без уведомлений и оверсэмплинга с уведомлениями.
+
+    Args:
+        features (List[np.ndarray]): Список последовательностей фреймов признаков.
+        labels (List[np.ndarray]): Список последовательностей меток.
+        downsample_factor (int): Коэффициент доунсемплинга для последовательностей с метками 0.
+        oversample_factor (int): Коэффициент оверсэмплинга для последовательностей с метками 1.
+        random_seed (int): Случайное зерно для воспроизводимости.
+
+    Returns:
+        Tuple[List[np.ndarray], List[np.ndarray]]: Сбалансированные списки последовательностей признаков и меток.
+    """
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+
+    # Разделяем на последовательности с уведомлениями и без
+    sequences_with_notification = []
+    sequences_without_notification = []
+
+    for f, l in zip(features, labels):
+        if np.any(l == 1):
+            sequences_with_notification.append((f, l))
+        else:
+            sequences_without_notification.append((f, l))
+
+    # Доунсемплинг последовательностей без уведомлений
+    num_sequences_without = len(sequences_without_notification) // downsample_factor
+    if num_sequences_without > 0:
+        sequences_without_downsampled = random.sample(sequences_without_notification, num_sequences_without)
+    else:
+        sequences_without_downsampled = []
+
+    # Оверсэмплинг последовательностей с уведомлениями
+    sequences_with_oversampled = sequences_with_notification * oversample_factor
+
+    # Объединяем сбалансированные данные
+    balanced_sequences = sequences_without_downsampled + sequences_with_oversampled
+
+    # Перемешиваем данные
+    random.shuffle(balanced_sequences)
+
+    # Разделяем обратно на признаки и метки
+    balanced_features = [seq[0] for seq in balanced_sequences]
+    balanced_labels = [seq[1] for seq in balanced_sequences]
+
+    return balanced_features, balanced_labels
 
 
 # Функция для построения модели
@@ -141,13 +227,16 @@ class F1ScoreCallback(Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         val_data, val_labels = self.validation_data
-        val_pred = self.model.predict(val_data)
-        val_pred_binary = (val_pred > 0.5).astype(int).flatten()
-        val_true = val_labels.flatten()
-        f1 = f1_score(val_true, val_pred_binary, zero_division=1)
-        precision = precision_score(val_true, val_pred_binary, zero_division=1)
-        recall = recall_score(val_true, val_pred_binary, zero_division=1)
-        auc = roc_auc_score(val_true, val_pred.flatten())
+        val_pred = self.model.predict(val_data, verbose=0)
+        y_pred_binary = (val_pred > 0.5).astype(int).flatten()
+        y_true = val_labels.flatten()
+        f1 = f1_score(y_true, y_pred_binary, zero_division=1)
+        precision = precision_score(y_true, y_pred_binary, zero_division=1)
+        recall = recall_score(y_true, y_pred_binary, zero_division=1)
+        try:
+            auc = roc_auc_score(y_true, val_pred.flatten())
+        except ValueError:
+            auc = 0.0  # Если все метки одного класса, AUC не определен
         print(f' - val_f1: {f1:.4f} - val_precision: {precision:.4f} - val_recall: {recall:.4f} - val_auc: {auc:.4f}')
 
 
@@ -163,7 +252,8 @@ class TQDMProgressBar(Callback):
         self.epoch_bar = tqdm(total=self.total_epochs, desc="Epochs", position=0)
 
     def on_epoch_begin(self, epoch, logs=None):
-        self.batch_bar = tqdm(total=self.params['steps'], desc=f"Epoch {epoch + 1}/{self.total_epochs}", position=1, leave=False)
+        self.batch_bar = tqdm(total=self.params['steps'], desc=f"Epoch {epoch + 1}/{self.total_epochs}", position=1,
+                              leave=False)
 
     def on_batch_end(self, batch, logs=None):
         self.batch_bar.update(1)
@@ -178,31 +268,46 @@ class TQDMProgressBar(Callback):
 
 # Основной блок
 if __name__ == "__main__":
-    # Укажите путь к папке с датасетом
-    dataset_folder = r'big_dataset'  # Замените на ваш путь
+    # Укажите путь к папке с сбалансированным датасетом
+    dataset_folder = r"D:\PyCharmProjects\Sounded\Tools\balanced_dataset"  # Замените на ваш путь
 
-    # Загружаем данные
-    features_list, labels_list = load_dataset(dataset_folder)
+    # Загружаем сбалансированные данные
+    print("Загрузка сбалансированного датасета...")
+    all_features, all_labels = load_balanced_dataset(dataset_folder)
+    print(f"Количество последовательностей признаков: {len(all_features)}")
+    print(f"Количество последовательностей меток: {len(all_labels)}")
 
-    # Установка новой длины последовательности
+    # Балансировка данных
+    print("Балансировка датасета...")
+    balanced_features, balanced_labels = balance_dataset_sequential(all_features, all_labels)
+
+    print(f"Количество сбалансированных последовательностей: {len(balanced_features)}")
+
+    # Определяем максимальную длину последовательности
     max_seq_length = LEN_SEQ
+    # Паддинг
+    print("Паддинг последовательностей признаков...")
+    X_padded = pad_sequences_custom(balanced_features, max_seq_length)
+    print("Паддинг меток...")
+    y_padded = pad_labels_custom(balanced_labels, max_seq_length)
 
-    # Паддим признаки и метки до новой длины для обучающих и тестовых данных
-    split_index = int(len(features_list) * 0.8)
-    X_train = pad_sequences(features_list[:split_index], max_seq_length)
-    y_train = pad_labels(labels_list[:split_index], max_seq_length)
+    print("Форма X_padded:", X_padded.shape)
+    print("Форма y_padded:", y_padded.shape)
 
-    X_test = pad_sequences(features_list[split_index:], max_seq_length)
-    y_test = pad_labels(labels_list[split_index:], max_seq_length)
+    # Разделяем на обучающую и тестовую выборки (80% обучающая, 20% тестовая)
+    split_index = int(len(X_padded) * 0.8)
+    X_train, X_test = X_padded[:split_index], X_padded[split_index:]
+    y_train, y_test = y_padded[:split_index], y_padded[split_index:]
 
-    print("Форма X_train после обрезки/паддинга:", X_train.shape)
-    print("Форма y_train после обрезки/паддинга:", y_train.shape)
-    print("Форма X_test после обрезки/паддинга:", X_test.shape)
-    print("Форма y_test после обрезки/паддинга:", y_test.shape)
+    print("Форма X_train после паддинга:", X_train.shape)
+    print("Форма y_train после паддинга:", y_train.shape)
+    print("Форма X_test после паддинга:", X_test.shape)
+    print("Форма y_test после паддинга:", y_test.shape)
 
     # Расширяем размерность меток для совместимости с моделью
     y_train = y_train[..., np.newaxis]
     y_test = y_test[..., np.newaxis]
+
     # Подсчет количества элементов в каждом классе для тренировочного набора
     train_class_0 = np.sum(y_train == 0)
     train_class_1 = np.sum(y_train == 1)
@@ -216,9 +321,15 @@ if __name__ == "__main__":
     print(f"Количество элементов класса '1' в y_train: {train_class_1}")
     print(f"Количество элементов класса '0' в y_test: {test_class_0}")
     print(f"Количество элементов класса '1' в y_test: {test_class_1}")
-    exit()
+
+    # Вычисление pos_weight на основе тренировочных данных
+    pos_weight = train_class_0 / train_class_1 if train_class_1 != 0 else 1.0
+    print(f"Вычисленный pos_weight: {pos_weight:.4f}")
+
     # Определяем форму входных данных
     input_shape = (X_train.shape[1], X_train.shape[2])  # (длина_последовательности, количество_признаков)
+
+    # Строим модель
     model = build_model(input_shape)
 
     # Вывод структуры модели
@@ -231,7 +342,7 @@ if __name__ == "__main__":
     # Проверка доступности GPU
     device_name = tf.test.gpu_device_name()
     if device_name != '/device:GPU:0':
-        print('GPU device not found')
+        print('GPU device not found. Обучение будет происходить на CPU, что может быть медленнее.')
     else:
         print('Found GPU at: {}'.format(device_name))
 
@@ -246,35 +357,44 @@ if __name__ == "__main__":
     optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001, weight_decay=1e-4)
 
     # Компиляция модели с взвешенной бинарной кросс-энтропией
-    pos_weight = 2.0  # Задайте нужный вес для положительного класса
-    model.compile(optimizer=optimizer, loss=weighted_binary_crossentropy(pos_weight), metrics=['accuracy', tf.keras.metrics.AUC(name='auc')])
+    model.compile(optimizer=optimizer, loss=weighted_binary_crossentropy(pos_weight),
+                  metrics=['accuracy', tf.keras.metrics.AUC(name='auc')])
 
     # Обучение модели
+    print("Начало обучения модели...")
     history = model.fit(
         X_train, y_train,
         epochs=EPOCH,
-        batch_size=8,
+        batch_size=BATCH_SIZE,
         validation_data=validation_data,
         callbacks=[f1_callback, progress_bar]
     )
 
     # Предсказание на тестовых данных
-    y_pred = model.predict(X_test)
+    print("Выполнение предсказаний на тестовой выборке...")
+    y_pred = model.predict(X_test, batch_size=BATCH_SIZE)
     y_pred_binary = (y_pred > 0.5).astype(int)
 
     # Получение таймкодов
+    print("Получение таймкодов из предсказаний...")
     timecodes = get_timecodes(y_pred_binary)
 
     # Вывод таймкодов для первого фрагмента
+    print("Таймкоды для первого фрагмента:")
     for tc in timecodes:
         if tc['sample_idx'] == 0:
             print(f"Фрагмент {tc['sample_idx']}: {tc['start_time']:.2f} s - {tc['end_time']:.2f} s")
 
     # Сохранение модели
-    model.save('notification_detection_model_with_weighted_bce_and_adamw.h5')
+    model_save_path = 'notification_detection_model_with_weighted_bce_and_adamw.h5'
+    print(f"Сохранение модели в {model_save_path}...")
+    model.save(model_save_path)
 
     # Визуализация потерь и точности
+    print("Визуализация результатов обучения...")
     plt.figure(figsize=(12, 4))
+
+    # Потери
     plt.subplot(1, 2, 1)
     plt.plot(history.history['loss'], label='Train Loss')
     plt.plot(history.history['val_loss'], label='Validation Loss')
@@ -283,6 +403,7 @@ if __name__ == "__main__":
     plt.ylabel('Потеря')
     plt.legend()
 
+    # Точность и AUC-ROC
     plt.subplot(1, 2, 2)
     plt.plot(history.history['accuracy'], label='Train Accuracy')
     plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
@@ -293,14 +414,17 @@ if __name__ == "__main__":
     plt.ylabel('Значение')
     plt.legend()
 
+    plt.tight_layout()
     plt.show()
 
     # Матрица ошибок (Confusion Matrix)
+    print("Построение матрицы ошибок...")
     y_pred_flat = y_pred_binary.flatten()
     y_true_flat = y_test.flatten()
     cm = confusion_matrix(y_true_flat, y_pred_flat)
     plt.figure(figsize=(6, 4))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted 0', 'Predicted 1'],
+                yticklabels=['True 0', 'True 1'])
     plt.xlabel('Предсказано')
     plt.ylabel('Истинно')
     plt.title('Матрица ошибок')
